@@ -7,8 +7,10 @@ This document explains how code under [`src/`](src/) fits together and how [`mai
 ## 1. Layout and execution model
 
 ```
-del-bayesian-enrichment/
+bayesian-del-signal-analysis/
   main.py              # CLI + demo orchestration
+  assets/              # curated plots for README/GitHub
+  out/                 # demo outputs (ignored by git)
   src/
     __init__.py        # Package facade (re-exports public API)
     simulator.py       # Synthetic count generation
@@ -18,8 +20,7 @@ del-bayesian-enrichment/
 
 **Import rule:** `main.py` uses imports such as `from src.analyzer import ...`. That works when the directory that **contains** the `src/` folder is on `sys.path`. In practice:
 
-- Run from the repo: `python del-bayesian-enrichment/main.py --demo` (the script’s parent folder, `del-bayesian-enrichment/`, is prepended to `sys.path`).
-- Or run from inside `del-bayesian-enrichment/`: `python main.py --demo`.
+- Run from the repo root: `python main.py --demo`.
 
 [`src/__init__.py`](src/__init__.py) does not auto-run anything; it only re-exports symbols so notebooks or other packages can do `import src` and get a stable surface.
 

@@ -1,0 +1,23 @@
+You are working in the `bayesian-del-signal-analysis/` repository.
+
+## Project architecture (authoritative)
+- **Flat repo root**: `main.py` lives in the project root alongside `src/`, `data/`, `notebooks/`, `out/`, `assets/`, `requirements.txt`.
+- **Entry point**: `main.py` is the CLI / demo orchestration only. It must **wire** modules together and avoid duplicating library logic.
+- **Imports**: code uses `from src.<module> import ...`. Assume the **repo root** is on `PYTHONPATH` (e.g. run `python main.py` from the repo root) so `src` resolves as a package.
+- **Boundaries**:
+  - `src/simulator.py`: synthetic DEL counts generation.
+  - `src/analyzer.py`: Bayesian enrichment inference and scaffold pooling/merge.
+  - `src/visualizer.py`: plotting only; no statistics.
+
+## Mathematical / statistical standards (Bayesian enrichment)
+- **Model**: per-compound (and optionally per-scaffold) enrichment via **independent Beta posteriors** for input and selected proportions with Binomial likelihoods (conjugate Beta updates) using total library sizes.
+- **Point estimate**: default point estimate for log2 enrichment is the **analytical posterior mean of the log-ratio**:
+  - Use \(E[\log p] = \psi(a) - \psi(a+b)\) (digamma) for \(p \sim \mathrm{Beta}(a,b)\).
+  - Then \(E[\log_2(p_\mathrm{sel}/p_\mathrm{in})]\) is the difference of those expectations divided by \(\ln 2\).
+  - Do **not** replace the point estimate with Monte Carlo unless there is a specific reason.
+- **Uncertainty**: credible intervals and \(P(\log_2\text{enrichment} > 0)\) may use **batched Monte Carlo** (memory-safe chunking). Support a mode that **skips** MC uncertainty when only point estimates are needed.
+- **Empirical Bayes prior**: prefer the library-wide **empirical Beta prior** (MoM fit on a bounded proxy of smoothed log fold squashed through a logistic, with MAD-scaled width). Include guarded fallbacks for degenerate variance / edge cases.
+
+## Documentation caution
+- Treat `README.md` as **potentially stale** regarding layout/history. When there is a mismatch, **trust the live flat repo structure** and the actual code under `main.py` + `src/`.
+

@@ -80,4 +80,5 @@ bayesian-del-signal-analysis/
 ## Notes
 - The point estimate for enrichment uses an analytical digamma identity; Monte Carlo is only used for uncertainty summaries when enabled.
 - Run `python main.py --demo` from the repo root so `src` resolves as a package.
+- The real-world pipeline is designed to scale to KinDEL-sized tables and has been exercised on the full KinDEL DDR1 library export (tens of millions of molecules) for ingestion and enrichment summarization.
 - This is intentionally minimal boilerplate you can extend with real DEL preprocessing and multi-round models.

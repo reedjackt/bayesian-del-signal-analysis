@@ -13,6 +13,7 @@ bayesian-del-signal-analysis/
   out/                 # demo outputs (ignored by git)
   src/
     __init__.py        # Package facade (re-exports public API)
+    importer.py        # Real-world ingestion (KinDEL schema → standardized count columns)
     simulator.py       # Synthetic count generation
     analyzer.py        # Beta-Binomial priors, digamma mean, batched MC uncertainty, scaffolds
     visualizer.py      # Matplotlib/Seaborn plots from enriched tables
@@ -42,10 +43,17 @@ flowchart LR
 | Module | Role | Primary inputs | Primary outputs |
 |--------|------|----------------|------------------|
 | [`simulator.py`](src/simulator.py) | Generate plausible **input** and **selected** read counts per compound (hits vs background, overdispersion, multinomial reallocation to library size). | `SimulationConfig` | `DataFrame` with `compound_id`, `is_hit`, `input_count`, `selected_count`, etc. |
+| [`importer.py`](src/importer.py) | Ingest real-world KinDEL tables: map schema columns → standardized `input_count`/`selected_count`, optional depth normalization across selected replicates, and common missing/low-count handling. | CSV/Parquet table + `KinDELImportConfig` | `DataFrame` suitable for `summarize_enrichment`. |
 | [`analyzer.py`](src/analyzer.py) | **Inference:** empirical Beta prior (MoM on a library proxy), conjugate Beta posteriors per compound, **digamma** closed form for `log2_enrichment_mean`, optional **batched** MC for CIs and `prob_enriched`, scaffold pooling + merge. | Count table + `BetaBinomialConfig` | Same rows plus enrichment columns; optional scaffold summary table. |
 | [`visualizer.py`](src/visualizer.py) | **Presentation:** scatter, ranked enrichment, volcano-style plot. No statistics; assumes columns already exist. | `DataFrame` + column names | `matplotlib.figure.Figure`; optional PNG path. |
 
 There is no shared runtime state: each function receives data explicitly, which keeps testing and notebook use straightforward.
+
+**Primary point estimator (base-2):** for \(p \sim \mathrm{Beta}(a,b)\),
+\[
+\mathbb{E}[\log_2(p)] = \frac{\psi(a) - \psi(a+b)}{\ln(2)},
+\]
+so \(\mathbb{E}[\log_2(p_\mathrm{sel}/p_\mathrm{in})]\) is computed as a difference of those expectations (digamma). Monte Carlo is reserved for credible intervals and \(P(\log_2(\cdot) > 0)\).
 
 ---
 
@@ -74,7 +82,7 @@ There is no shared runtime state: each function receives data explicitly, which 
 7. **Plotting**  
    `plot_enrichment_scatter`, `plot_ranked_enrichment`, `plot_volcano` write PNGs under `outdir`.
 
-`main()` only parses CLI flags (`--demo`, `--outdir`) and delegates to `run_demo` or prints help. There is no plugin system: to add stages (e.g. real FASTQ ingestion), extend `run_demo` or add new entrypoints alongside `main.py`.
+`main()` only parses CLI flags and delegates to `run_demo` (simulation) or a real-world ingest path (currently KinDEL via `src/importer.py`). There is no plugin system: to add stages (e.g. real FASTQ ingestion), extend the orchestration functions or add new entrypoints alongside `main.py`.
 
 ---
 
@@ -105,7 +113,7 @@ The analyzer derives `total_input` and `total_selected` as **column sums** each 
 
 | Goal | Suggested change |
 |------|------------------|
-| Real DEL counts | Add a module or script that builds the same DataFrame schema; call `summarize_enrichment` unchanged. |
+| Real DEL counts | Use `src/importer.py` (KinDEL) or add a loader that emits the same `input_count`/`selected_count` contract; call `summarize_enrichment` unchanged. |
 | Different prior | Set `use_empirical_prior=False` and tune `alpha_prior` / `beta_prior`, or extend `estimate_empirical_beta_prior` with a documented alternative. |
 | Faster demos | Lower `mc_samples` or use `uncertainty_mode="none"` during development. |
 | New plots | Add functions in `visualizer.py` that read enrichment columns; keep plotting separate from `analyzer.py` to avoid circular imports and heavy deps in tests. |

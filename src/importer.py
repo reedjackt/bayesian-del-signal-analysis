@@ -1,0 +1,206 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Literal, Sequence
+
+import numpy as np
+import pandas as pd
+
+
+@dataclass(frozen=True)
+class KinDELImportConfig:
+    """
+    Import configuration for insitro / KinDEL-style count tables.
+
+    Expected columns (default):
+      - pre-selection_counts  -> input_count
+      - target_replicate_1/2/3 -> selected replicate counts
+    """
+
+    input_col: str = "pre-selection_counts"
+    selected_replicate_cols: tuple[str, ...] = (
+        "target_replicate_1",
+        "target_replicate_2",
+        "target_replicate_3",
+    )
+    id_col_candidates: tuple[str, ...] = ("compound_id", "compound", "compoundId", "id")
+    output_input_col: str = "input_count"
+    output_selected_col: str = "selected_count"
+
+    fillna_with_zero: bool = True
+    min_input_count: int = 0
+    min_selected_count: int = 0
+    min_total_count: int = 0
+
+    selected_aggregation: Literal["sum_raw", "sum_scaled_depth"] = "sum_scaled_depth"
+    depth_target: Literal["median", "mean", "min", "max"] = "median"
+
+
+class LibraryScaler:
+    """
+    Sequencing-depth normalizer for per-pool count columns.
+
+    For combining multiple selected replicates into a single `selected_count`,
+    scaling each replicate to a common target depth prevents a single deep pool
+    from dominating the combined library.
+    """
+
+    def __init__(self, target: Literal["median", "mean", "min", "max"] = "median") -> None:
+        self.target = target
+        self.totals_: dict[str, float] = {}
+        self.scale_factors_: dict[str, float] = {}
+        self.target_total_: float | None = None
+
+    @staticmethod
+    def _safe_total(x: pd.Series) -> float:
+        s = pd.to_numeric(x, errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        return float(np.sum(np.clip(s, 0.0, np.inf)))
+
+    def fit(self, df: pd.DataFrame, cols: Sequence[str]) -> "LibraryScaler":
+        totals = {c: self._safe_total(df[c]) for c in cols}
+        arr = np.array(list(totals.values()), dtype=float)
+        if np.any(arr < 0) or np.all(arr <= 0):
+            raise ValueError("All pool totals are non-positive; cannot depth-normalize.")
+
+        if self.target == "median":
+            target_total = float(np.median(arr[arr > 0]))
+        elif self.target == "mean":
+            target_total = float(np.mean(arr[arr > 0]))
+        elif self.target == "min":
+            target_total = float(np.min(arr[arr > 0]))
+        elif self.target == "max":
+            target_total = float(np.max(arr[arr > 0]))
+        else:
+            raise ValueError(f"Unknown depth target: {self.target}")
+
+        scale = {}
+        for c, tot in totals.items():
+            if tot <= 0:
+                scale[c] = 0.0
+            else:
+                scale[c] = target_total / float(tot)
+
+        self.totals_ = totals
+        self.scale_factors_ = scale
+        self.target_total_ = target_total
+        return self
+
+    def transform(self, df: pd.DataFrame, cols: Sequence[str]) -> pd.DataFrame:
+        if not self.scale_factors_:
+            raise ValueError("LibraryScaler is not fit; call fit() first.")
+        out = df.copy()
+        for c in cols:
+            if c not in out.columns:
+                raise ValueError(f"Missing column for scaling: {c}")
+            factor = float(self.scale_factors_.get(c, 1.0))
+            v = pd.to_numeric(out[c], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+            v = np.clip(v, 0.0, np.inf) * factor
+            out[c] = np.rint(v).astype(np.int64)
+        return out
+
+    def fit_transform(self, df: pd.DataFrame, cols: Sequence[str]) -> pd.DataFrame:
+        return self.fit(df, cols).transform(df, cols)
+
+
+def read_table(path: str | Path) -> pd.DataFrame:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(str(p))
+    if p.suffix.lower() in {".parquet", ".pq"}:
+        return pd.read_parquet(p)
+    if p.suffix.lower() in {".csv", ".tsv"}:
+        sep = "\t" if p.suffix.lower() == ".tsv" else ","
+        return pd.read_csv(p, sep=sep)
+    raise ValueError(f"Unsupported input extension: {p.suffix}")
+
+
+def _first_present(df: pd.DataFrame, candidates: Iterable[str]) -> str | None:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def import_kindel_counts(
+    df: pd.DataFrame,
+    config: KinDELImportConfig = KinDELImportConfig(),
+) -> pd.DataFrame:
+    """
+    Convert a KinDEL-like table into the project-wide count contract:
+      - `input_count`
+      - `selected_count`
+
+    The output preserves all original columns and appends/overwrites
+    the standardized count columns.
+    """
+    if config.input_col not in df.columns:
+        raise ValueError(f"Missing KinDEL input column: {config.input_col}")
+    for c in config.selected_replicate_cols:
+        if c not in df.columns:
+            raise ValueError(f"Missing KinDEL selected replicate column: {c}")
+
+    out = df.copy()
+    count_cols = (config.input_col, *config.selected_replicate_cols)
+    for c in count_cols:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+        if config.fillna_with_zero:
+            out[c] = out[c].fillna(0.0)
+        out[c] = np.clip(out[c].to_numpy(dtype=float), 0.0, np.inf)
+
+    # Standardize/ensure an identifier column exists when possible (non-fatal).
+    id_col = _first_present(out, config.id_col_candidates)
+    if id_col is None:
+        out.insert(0, "compound_id", np.arange(len(out), dtype=np.int64))
+    elif id_col != "compound_id":
+        out = out.rename(columns={id_col: "compound_id"})
+
+    out[config.output_input_col] = np.rint(out[config.input_col].to_numpy(dtype=float)).astype(
+        np.int64
+    )
+
+    if config.selected_aggregation == "sum_raw":
+        sel = np.zeros(len(out), dtype=np.int64)
+        for c in config.selected_replicate_cols:
+            sel += np.rint(out[c].to_numpy(dtype=float)).astype(np.int64)
+        out[config.output_selected_col] = sel
+
+    elif config.selected_aggregation == "sum_scaled_depth":
+        scaler = LibraryScaler(target=config.depth_target)
+        scaled = scaler.fit_transform(out, list(config.selected_replicate_cols))
+        sel = np.zeros(len(scaled), dtype=np.int64)
+        for c in config.selected_replicate_cols:
+            sel += scaled[c].to_numpy(dtype=np.int64)
+        out[config.output_selected_col] = sel
+        out.attrs["kindel_selected_pool_totals"] = scaler.totals_
+        out.attrs["kindel_selected_pool_scale_factors"] = scaler.scale_factors_
+        out.attrs["kindel_selected_depth_target_total"] = scaler.target_total_
+
+    else:
+        raise ValueError(f"Unknown selected_aggregation: {config.selected_aggregation}")
+
+    # Low-count filters (common in real sequencing tables).
+    mask = np.ones(len(out), dtype=bool)
+    if config.min_input_count > 0:
+        mask &= out[config.output_input_col].to_numpy(dtype=np.int64) >= int(config.min_input_count)
+    if config.min_selected_count > 0:
+        mask &= out[config.output_selected_col].to_numpy(dtype=np.int64) >= int(
+            config.min_selected_count
+        )
+    if config.min_total_count > 0:
+        tot = out[config.output_input_col].to_numpy(dtype=np.int64) + out[
+            config.output_selected_col
+        ].to_numpy(dtype=np.int64)
+        mask &= tot >= int(config.min_total_count)
+
+    out = out.loc[mask].reset_index(drop=True)
+    return out
+
+
+def load_kindel_dataset(
+    path: str | Path,
+    config: KinDELImportConfig = KinDELImportConfig(),
+) -> pd.DataFrame:
+    df = read_table(path)
+    return import_kindel_counts(df, config=config)
+

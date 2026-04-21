@@ -23,9 +23,14 @@ from .visualizer import (
     plot_enrichment_scatter,
     plot_volcano,
 )
+from .importer import KinDELImportConfig, LibraryScaler, import_kindel_counts, load_kindel_dataset
 
 __all__ = [
     "simulate_del_experiment",
+    "KinDELImportConfig",
+    "LibraryScaler",
+    "import_kindel_counts",
+    "load_kindel_dataset",
     "BetaBinomialConfig",
     "beta_binomial_posterior",
     "beta_mom_from_mean_var",

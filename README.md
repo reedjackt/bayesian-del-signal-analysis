@@ -49,12 +49,13 @@ bayesian-del-signal-analysis/
   data/
   notebooks/
   out/                # demo outputs (ignored by git)
+  main.py             # CLI entry point (demo orchestration)
   src/
-  main.py
   requirements.txt
 ```
 
 ## Notes
 - The point estimate for enrichment uses an analytical digamma identity; Monte Carlo is only used for uncertainty summaries when enabled.
+- Run `python main.py --demo` from the repo root so `src` resolves as a package.
 - This is intentionally minimal boilerplate you can extend with real DEL preprocessing and multi-round models.
 

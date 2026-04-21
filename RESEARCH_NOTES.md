@@ -64,7 +64,7 @@ We wanted a **library-informed** prior without introducing a heavy per-iteration
 Enrichment itself lives on the real line; the Beta family does not directly model log-folds. The implementation therefore uses a **documented, deterministic proxy**:
 
 1. Compute a **smoothed empirical log fold** per compound using pseudocounts (stabilizes low-count tails).
-2. Map to $(0,1)$ via a **logistic squashing** $u = \mathrm{expit}(\mathrm{log\_fold}/\tau)$, with $\tau$ scaled by a **robust spread** of the library (median absolute deviation, floored to avoid division by zero).
+2. Map to $(0,1)$ via a **logistic squashing** $u = \mathrm{expit}(\text{log\_fold}/\tau)$, with $\tau$ scaled by a **robust spread** of the library (median absolute deviation, floored to avoid division by zero).
 3. Fit **$\mathrm{Beta}(\alpha, \beta)$** to the empirical distribution of $u$ using **MoM**: closed-form inversion from mean and variance, with **guarded fallbacks** to $\mathrm{Beta}(1,1)$ when the empirical variance is inconsistent with any Beta (boundary or degenerate cases).
 
 ### 3.3 Why MoM here (stability / speed trade)

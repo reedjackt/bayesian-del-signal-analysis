@@ -1,84 +1,116 @@
-# DEL Bayesian Enrichment
+# DEL Bayesian Enrichment — Applied Data Engineering
 
-Lightweight toolkit for simulating DNA-Encoded Library (DEL) selection experiments and analyzing enrichment using a Beta-Binomial Bayesian model.
+This repository is an **applied data engineering** project for DNA-encoded library (DEL) selection readouts. The focus is **high-cardinality, sparse count tables**: millions of distinct chemical entities, most observed only a handful of times, with heavy-tailed sampling noise. The shipped pipeline normalizes heterogeneous exports, runs conjugate Beta–Binomial enrichment at library scale, and keeps memory and runtime bounded so multi-gigabyte Parquet inputs remain practical on a single machine.
 
-## What’s included
-- `src/simulator.py`: Standard DEL-style simulation (counts, selection, amplification/noise)
-- `src/importer.py`: Real-world ingestion (KinDEL schema → `input_count`/`selected_count`, depth normalization, filters)
-- `src/analyzer.py`: Beta-Binomial Bayesian enrichment inference with credible intervals
-- `src/visualizer.py`: Common enrichment plots (ranked enrichment, scatter, volcano-like)
-- `main.py`: Simple entry point to simulate + analyze + plot
+## System performance
 
-## Quickstart
+| Dimension | Implementation / outcome |
+|-----------|---------------------------|
+| **Dataset scale** | **912,789** unique compounds on a **~1M-row** KinDEL DDR1 extract (subset of the full **~81M-row** KinDEL library). |
+| **Ingestion** | **Native Parquet** I/O plus **automated schema normalization** (column aliasing, depth normalization across replicates, optional low-count filters) in `src/importer.py`. |
+| **Computational efficiency** | Full-library uncertainty no longer relies on materializing Monte Carlo sample tensors. **Analytical digamma means** for point estimates and **delta-method** Normal approximations for intervals and enrichment probability (`BetaBinomialConfig(uncertainty_mode="delta")` in `src/analyzer.py`) keep end-to-end enrichment **under ~60 seconds** on this workload class. |
+| **Memory management** | **Explicit `gc.collect()`** after large frame transitions and **hexbin** density plots (1D arrays only) avoid duplicate wide tables for QC visuals. Observed **peak RAM ~1.45 GB** for the production-scale DDR1 run documented in `notebooks/real_world_exploration.ipynb`. |
 
-Create a virtual environment, then install dependencies:
+## Bayesian shield (why shrinkage matters)
 
-```bash
-pip install -r requirements.txt
-```
+The **Beta–Binomial** layer is not decorative: it is the main defense against low-count volatility. An **empirical Beta prior** (method-of-moments fit on a library-wide proxy, with guarded fallbacks) pulls thousands of weak-evidence compounds toward the bulk prior instead of letting Poisson-like noise masquerade as signal.
 
-Run the demo pipeline:
+On the DDR1 production extract, that shrinkage plus posterior **\(P(\log_2 \text{enrichment} > 0)\)** triage effectively **suppresses noise across 700k+ low-confidence rows** while surfacing **148,965** compounds above **\(P > 0.95\)** as high-confidence enrichment candidates. At scaffold level, the strongest chemical family in this run is **`c2de1253`** with **7.76** log₂ enrichment versus the library background—useful for prioritizing synthesis follow-up.
+
+## Engineering robustness (testing)
+
+Early development used **synthetic DEL counts** (`src/simulator.py`, `python main.py --demo`) to validate end-to-end wiring. That synthetic path is now treated explicitly as a **validation suite**: known ground truth for hit structure and count generative assumptions lets you regression-test **statistical logic** (posterior means, priors, triage, scaffold pooling) before pointing the same code at **multi-gigabyte** experimental Parquet files where labels are unknown and failures are expensive.
+
+Run the synthetic check from the repo root:
 
 ```bash
 python main.py --demo
 ```
 
-Outputs (CSV + plots) are written to `out/` by default.
+Outputs land in `out/` (CSVs + plots). Extend tests or notebooks to assert properties of the enriched frame against simulated hits.
 
-## Results Showcase
+## Repository cleanup (data layout)
 
-Ranked Bayesian enrichment (blue “Hits” are simulated high-confidence binders surfaced via Bayesian shrinkage):
+The pipeline expects a **binary Parquet** file, for example:
+
+`data/kindel_ddr1_real.parquet`
+
+If you see a file named `data/kindel_ddr1_real.parquet.htm`, that is a **misnamed or browser-saved artifact**, not a valid Parquet file—**delete it locally** or ensure it is **git-ignored** (the repo ignores `*.parquet.htm`). Replace it with the real `.parquet` export from your data provider.
+
+## What’s included
+
+- `src/simulator.py` — Synthetic DEL-style counts (validation suite / demos)
+- `src/importer.py` — KinDEL-style ingestion → `input_count` / `selected_count`
+- `src/analyzer.py` — Beta–Binomial enrichment, digamma means, delta-method (or optional batched MC) uncertainty, scaffold aggregation
+- `src/visualizer.py` — Enrichment scatter, ranked, volcano-style plots
+- `main.py` — CLI: `--demo` or `--input … --schema kindel`
+- `notebooks/real_world_exploration.ipynb` — Production-scale KinDEL walkthrough
+
+## Quickstart
+
+```bash
+pip install -r requirements.txt
+python main.py --demo
+```
+
+Real KinDEL Parquet (after placing the file under `data/`):
+
+```bash
+python main.py --input data/kindel_ddr1_real.parquet --schema kindel --outdir out
+```
+
+Optional sparsity filters (recommended on noisy tables):
+
+```bash
+python main.py --input data/kindel_ddr1_real.parquet --schema kindel --min-total-count 3 --outdir out
+```
+
+Force uncertainty mode explicitly if needed:
+
+```bash
+python main.py --input data/kindel_ddr1_real.parquet --schema kindel --uncertainty-mode delta --outdir out
+```
+
+## How it works (compact)
+
+Per compound, **input** and **selected** counts update independent **Beta** posteriors under a **Binomial** likelihood. The primary **log₂ enrichment** summary is the posterior expectation of the log-ratio,
+
+\[
+\mathbb{E}[\log_2(p_\mathrm{sel}/p_\mathrm{in})]
+= \frac{1}{\ln 2}\Bigl(
+\bigl(\psi(a_\mathrm{sel}) - \psi(a_\mathrm{sel}+b_\mathrm{sel})\bigr)
+-
+\bigl(\psi(a_\mathrm{in}) - \psi(a_\mathrm{in}+b_\mathrm{in})\bigr)
+\Bigr),
+\]
+
+with \(\psi\) the digamma function. Uncertainty defaults to a **delta-method** Gaussian approximation over the same parameters; batched Monte Carlo remains available for comparison or small-\(n\) studies.
+
+## Results showcase (synthetic demo)
+
+Ranked Bayesian enrichment (blue “Hits” are simulated high-confidence binders):
 
 ![Ranked enrichment plot](assets/ranked_enrichment.png)
 
-Volcano-like view of enrichment vs signal strength (blue “Hits” are simulated high-confidence binders surfaced via Bayesian shrinkage):
+Volcano-like view of enrichment vs signal strength:
 
 ![Volcano-like plot](assets/volcano_like.png)
-
-## How it Works
-
-We model **input** and **selected** read counts as noisy observations of underlying per-compound rates. Using a **Beta prior** with a **Binomial likelihood**, each compound’s input and selected rates have conjugate **Beta posteriors**. Enrichment is summarized as the posterior expectation of log fold-change:
-
-- **Analytical mean (primary point estimate)**: for $p \sim \mathrm{Beta}(a,b)$,
-  $$E[\log_2(p)] = \frac{\psi(a) - \psi(a+b)}{\ln(2)}.$$
-  The pipeline uses this identity to compute $E[\log_2(p_\mathrm{sel}/p_\mathrm{in})]$ as a difference of expectations (digamma), giving a stable point estimate without slow Monte Carlo.
-- **Uncertainty (optional)**: credible intervals and $P(\log_2 \text{enrichment} > 0)$ can be estimated via batched Monte Carlo sampling when needed.
-
-## Real-World Data (KinDEL)
-If you have an insitro/KinDEL-style count table, you can run the same Bayesian enrichment pipeline on a CSV/TSV/Parquet file.
-
-KinDEL column mapping (default):
-- `pre-selection_counts` → `input_count`
-- `target_replicate_1`, `target_replicate_2`, `target_replicate_3` → depth-normalized and aggregated into `selected_count`
-
-Run:
-
-```bash
-python main.py --input path/to/kindel_counts.parquet --schema kindel --outdir out
-```
-
-Optional filters (recommended for sparse tables):
-
-```bash
-python main.py --input path/to/kindel_counts.csv --schema kindel --min-total-count 3 --outdir out
-```
 
 ## Project layout
 
 ```
 bayesian-del-signal-analysis/
-  assets/             # curated plots for README/GitHub
-  data/
-  notebooks/
-  out/                # demo outputs (ignored by git)
-  main.py             # CLI entry point (demo orchestration)
+  assets/             # curated plots for README
+  data/               # local Parquet inputs (large files not committed)
+  notebooks/          # production-scale exploration
+  out/                # run outputs (gitignored)
+  main.py
   src/
-    importer.py       # real-world ingestion (KinDEL)
   requirements.txt
 ```
 
 ## Notes
-- The point estimate for enrichment uses an analytical digamma identity; Monte Carlo is only used for uncertainty summaries when enabled.
-- Run `python main.py --demo` from the repo root so `src` resolves as a package.
-- The real-world pipeline is designed to scale to KinDEL-sized tables and has been exercised on the full KinDEL DDR1 library export (tens of millions of molecules) for ingestion and enrichment summarization.
-- This is intentionally minimal boilerplate you can extend with real DEL preprocessing and multi-round models.
+
+- Run `python main.py` from the **repo root** so `from src.…` imports resolve.
+- For library-scale runs, prefer **`uncertainty_mode="delta"`** (default in `BetaBinomialConfig`) unless you need batched MC for a subset.
+- Deeper methods discussion: [`RESEARCH_NOTES.md`](RESEARCH_NOTES.md). Module wiring: [`DEVELOPER_GUIDE.md`](DEVELOPER_GUIDE.md).

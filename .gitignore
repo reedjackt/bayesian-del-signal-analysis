@@ -59,3 +59,6 @@ Thumbs.db
 
 # Project outputs
 out/
+
+# Misnamed downloads (HTML saved with a Parquet-looking suffix — not valid Parquet)
+*.parquet.htm

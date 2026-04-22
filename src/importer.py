@@ -32,9 +32,24 @@ class KinDELImportConfig:
     min_input_count: int = 0
     min_selected_count: int = 0
     min_total_count: int = 0
+    fail_on_all_zero_selected_replicates: bool = True
+    warn_on_zero_selected_replicates: bool = True
+    # LibraryScaler corrects unequal sequencing depth across replicates; this
+    # gate catches pathological totals (mislabels / index hopping). KinDEL runs
+    # often have one replicate materially deeper without implying failure — use a
+    # permissive default and tune via CLI when needed.
+    max_selected_replicate_imbalance: float | None = 500.0
 
     selected_aggregation: Literal["sum_raw", "sum_scaled_depth"] = "sum_scaled_depth"
     depth_target: Literal["median", "mean", "min", "max"] = "median"
+
+    # Optional scaffold key for downstream ``aggregate_enrichment_by_scaffold``.
+    # If ``scaffold_id_col`` is set, that column is copied to ``scaffold_id``.
+    # Else if ``molecule_hash_prefix_len`` is set, ``scaffold_id`` is the first
+    # ``molecule_hash_prefix_len`` characters of ``molecule_hash_col``.
+    scaffold_id_col: str | None = None
+    molecule_hash_col: str = "molecule_hash"
+    molecule_hash_prefix_len: int | None = None
 
 
 class LibraryScaler:
@@ -115,11 +130,53 @@ def read_table(path: str | Path) -> pd.DataFrame:
     raise ValueError(f"Unsupported input extension: {p.suffix}")
 
 
+def _normalize_kindel_column_aliases(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Map public KinDEL Parquet column names onto the CSV-style contract expected
+    by :class:`KinDELImportConfig` (e.g. seq_load / seq_target_* from
+    kin-del-2024 Parquet dumps).
+    """
+    out = df
+    rename: dict[str, str] = {}
+    if "pre-selection_counts" not in out.columns and "seq_load" in out.columns:
+        rename["seq_load"] = "pre-selection_counts"
+    for i in (1, 2, 3):
+        tr = f"target_replicate_{i}"
+        st = f"seq_target_{i}"
+        if tr not in out.columns and st in out.columns:
+            rename[st] = tr
+    if rename:
+        out = out.rename(columns=rename)
+    return out
+
+
 def _first_present(df: pd.DataFrame, candidates: Iterable[str]) -> str | None:
     for c in candidates:
         if c in df.columns:
             return c
     return None
+
+
+def _assign_scaffold_id(out: pd.DataFrame, config: KinDELImportConfig) -> pd.DataFrame:
+    """Populate ``scaffold_id`` from an explicit column or a molecule-hash prefix."""
+    if config.scaffold_id_col is not None:
+        col = config.scaffold_id_col
+        if col not in out.columns:
+            raise ValueError(f"scaffold_id_col={col!r} not found in table.")
+        out["scaffold_id"] = out[col].astype(str)
+        return out
+    if config.molecule_hash_prefix_len is not None:
+        n = int(config.molecule_hash_prefix_len)
+        if n <= 0:
+            raise ValueError("molecule_hash_prefix_len must be a positive integer.")
+        hcol = config.molecule_hash_col
+        if hcol not in out.columns:
+            raise ValueError(
+                f"molecule_hash_prefix_len is set but column {hcol!r} is missing."
+            )
+        out["scaffold_id"] = out[hcol].astype(str).str.slice(0, n)
+        return out
+    return out
 
 
 def import_kindel_counts(
@@ -166,18 +223,56 @@ def import_kindel_counts(
         out[config.output_selected_col] = sel
 
     elif config.selected_aggregation == "sum_scaled_depth":
-        scaler = LibraryScaler(target=config.depth_target)
-        scaled = scaler.fit_transform(out, list(config.selected_replicate_cols))
-        sel = np.zeros(len(scaled), dtype=np.int64)
-        for c in config.selected_replicate_cols:
-            sel += scaled[c].to_numpy(dtype=np.int64)
-        out[config.output_selected_col] = sel
-        out.attrs["kindel_selected_pool_totals"] = scaler.totals_
-        out.attrs["kindel_selected_pool_scale_factors"] = scaler.scale_factors_
-        out.attrs["kindel_selected_depth_target_total"] = scaler.target_total_
+        # Dataset-level QC for real sequencing runs.
+        totals = {c: LibraryScaler._safe_total(out[c]) for c in config.selected_replicate_cols}
+        positive_totals = [t for t in totals.values() if t > 0]
+        if len(positive_totals) == 0:
+            if config.fail_on_all_zero_selected_replicates:
+                raise ValueError(
+                    "All selected replicate library totals are zero; cannot compute selected_count. "
+                    f"Columns={list(config.selected_replicate_cols)} totals={totals}. "
+                    "This usually indicates a failed selection sequencing run, a schema mismatch, "
+                    "or upstream filtering that removed all selected counts."
+                )
+            out[config.output_selected_col] = np.zeros(len(out), dtype=np.int64)
+            out.attrs["kindel_selected_pool_totals"] = totals
+            out.attrs["kindel_selected_pool_scale_factors"] = {c: 0.0 for c in totals}
+            out.attrs["kindel_selected_depth_target_total"] = 0.0
+        else:
+            zero_reps = [c for c, t in totals.items() if t <= 0]
+            if zero_reps and config.warn_on_zero_selected_replicates:
+                out.attrs["kindel_selected_zero_replicates"] = {
+                    "columns": zero_reps,
+                    "totals": {c: totals[c] for c in zero_reps},
+                }
+
+            if config.max_selected_replicate_imbalance is not None and len(positive_totals) >= 2:
+                tmin = float(np.min(positive_totals))
+                tmax = float(np.max(positive_totals))
+                ratio = (tmax / tmin) if tmin > 0 else float("inf")
+                if ratio > float(config.max_selected_replicate_imbalance):
+                    raise ValueError(
+                        "Selected replicate library totals are extremely imbalanced; refusing to "
+                        "depth-normalize because this is usually contamination / index hopping / "
+                        f"mislabeling. totals={totals} ratio={ratio:.3g} "
+                        f"threshold={config.max_selected_replicate_imbalance}."
+                    )
+
+            scaler = LibraryScaler(target=config.depth_target)
+            scaled = scaler.fit_transform(out, list(config.selected_replicate_cols))
+            # Sum as float then round once to reduce low-count rounding artifacts.
+            sel_f = np.zeros(len(scaled), dtype=float)
+            for c in config.selected_replicate_cols:
+                sel_f += scaled[c].to_numpy(dtype=float)
+            out[config.output_selected_col] = np.rint(sel_f).astype(np.int64)
+            out.attrs["kindel_selected_pool_totals"] = scaler.totals_
+            out.attrs["kindel_selected_pool_scale_factors"] = scaler.scale_factors_
+            out.attrs["kindel_selected_depth_target_total"] = scaler.target_total_
 
     else:
         raise ValueError(f"Unknown selected_aggregation: {config.selected_aggregation}")
+
+    out = _assign_scaffold_id(out, config)
 
     # Low-count filters (common in real sequencing tables).
     mask = np.ones(len(out), dtype=bool)
@@ -194,6 +289,14 @@ def import_kindel_counts(
         mask &= tot >= int(config.min_total_count)
 
     out = out.loc[mask].reset_index(drop=True)
+    # Guardrail: make downstream Bayesian model failures actionable.
+    if len(out) == 0:
+        raise ValueError(
+            "All rows were filtered out during import. "
+            f"Filters: min_input_count={config.min_input_count}, "
+            f"min_selected_count={config.min_selected_count}, "
+            f"min_total_count={config.min_total_count}."
+        )
     return out
 
 
@@ -202,5 +305,6 @@ def load_kindel_dataset(
     config: KinDELImportConfig = KinDELImportConfig(),
 ) -> pd.DataFrame:
     df = read_table(path)
+    df = _normalize_kindel_column_aliases(df)
     return import_kindel_counts(df, config=config)
 

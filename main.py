@@ -10,6 +10,7 @@ from src.importer import KinDELImportConfig, load_kindel_dataset
 from src.analyzer import (
     BetaBinomialConfig,
     aggregate_enrichment_by_scaffold,
+    final_triage_hits,
     merge_scaffold_enrichment,
     summarize_enrichment,
     top_hits,
@@ -32,8 +33,10 @@ def run_demo(outdir: Path) -> None:
     df2 = merge_scaffold_enrichment(df2, sc)
     df2.to_csv(outdir / "enrichment_results.csv", index=False)
 
-    hits = top_hits(df2, k=50)
-    hits.to_csv(outdir / "top_hits.csv", index=False)
+    triage = final_triage_hits(df2, k=50, prob_min=0.95)
+    if triage.empty:
+        triage = top_hits(df2, k=50)
+    triage.to_csv(outdir / "top_hits.csv", index=False)
 
     plot_enrichment_scatter(df2, outpath=outdir / "counts_scatter.png")
     plot_ranked_enrichment(df2, outpath=outdir / "ranked_enrichment.png")
@@ -44,13 +47,17 @@ def run_real_world_kindel(
     outdir: Path,
     input_path: Path,
     *,
-    min_total_count: int = 0,
+    kindel_config: KinDELImportConfig | None = None,
     uncertainty_mode: str | None = None,
+    hit_prob_min: float = 0.95,
+    hit_k: int = 50,
 ) -> None:
     outdir.mkdir(parents=True, exist_ok=True)
     df_raw = load_kindel_dataset(
         input_path,
-        config=KinDELImportConfig(min_total_count=int(min_total_count)),
+        config=kindel_config
+        if kindel_config is not None
+        else KinDELImportConfig(),
     )
     df_raw.to_csv(outdir / "imported_counts.csv", index=False)
 
@@ -67,8 +74,10 @@ def run_real_world_kindel(
 
     df2.to_csv(outdir / "enrichment_results.csv", index=False)
 
-    hits = top_hits(df2, k=50)
-    hits.to_csv(outdir / "top_hits.csv", index=False)
+    triage = final_triage_hits(df2, k=int(hit_k), prob_min=float(hit_prob_min))
+    if triage.empty:
+        triage = top_hits(df2, k=int(hit_k))
+    triage.to_csv(outdir / "top_hits.csv", index=False)
 
     plot_enrichment_scatter(df2, outpath=outdir / "counts_scatter.png")
     plot_ranked_enrichment(df2, outpath=outdir / "ranked_enrichment.png")
@@ -104,8 +113,47 @@ def main() -> None:
         "--uncertainty-mode",
         type=str,
         default=None,
-        choices=["mc_batched", "none"],
-        help='Uncertainty calculation mode: "mc_batched" (default) or "none" to skip MC',
+        choices=["delta", "mc_batched", "none"],
+        help='Uncertainty calculation mode: "delta" (fast, memory-safe), "mc_batched" (expensive), or "none"',
+    )
+    parser.add_argument(
+        "--scaffold-col",
+        type=str,
+        default=None,
+        metavar="COL",
+        help="Use this column as scaffold_id for family-level aggregation (overrides hash prefix)",
+    )
+    parser.add_argument(
+        "--molecule-hash-prefix-len",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Set scaffold_id to the first N characters of molecule_hash (DDR1-friendly)",
+    )
+    parser.add_argument(
+        "--max-selected-replicate-imbalance",
+        type=float,
+        default=None,
+        metavar="RATIO",
+        help="Max max/min ratio across positive selected-pool totals before failing (default: 500).",
+    )
+    parser.add_argument(
+        "--disable-selected-replicate-imbalance-check",
+        action="store_true",
+        help="Skip the selected-pool imbalance guardrail (not recommended)",
+    )
+    parser.add_argument(
+        "--hit-prob-min",
+        type=float,
+        default=0.95,
+        help="final triage: require prob_enriched > this (default 0.95)",
+    )
+    parser.add_argument(
+        "--hits",
+        type=int,
+        default=50,
+        metavar="K",
+        help="Number of rows to keep in top_hits after triage (default 50)",
     )
     args = parser.parse_args()
 
@@ -114,11 +162,30 @@ def main() -> None:
     if args.input is not None:
         if args.schema != "kindel":
             raise ValueError(f"Unsupported schema: {args.schema}")
+        if args.disable_selected_replicate_imbalance_check:
+            max_imb: float | None = None
+        elif args.max_selected_replicate_imbalance is not None:
+            max_imb = float(args.max_selected_replicate_imbalance)
+        else:
+            max_imb = KinDELImportConfig.max_selected_replicate_imbalance
+
+        kindel_kw: dict = {"min_total_count": int(args.min_total_count)}
+        if max_imb is not None:
+            kindel_kw["max_selected_replicate_imbalance"] = max_imb
+        else:
+            kindel_kw["max_selected_replicate_imbalance"] = None
+        if args.scaffold_col is not None:
+            kindel_kw["scaffold_id_col"] = args.scaffold_col
+        if args.molecule_hash_prefix_len is not None:
+            kindel_kw["molecule_hash_prefix_len"] = int(args.molecule_hash_prefix_len)
+
         run_real_world_kindel(
             outdir,
             Path(args.input),
-            min_total_count=int(args.min_total_count),
+            kindel_config=KinDELImportConfig(**kindel_kw),
             uncertainty_mode=args.uncertainty_mode,
+            hit_prob_min=float(args.hit_prob_min),
+            hit_k=int(args.hits),
         )
         return
 

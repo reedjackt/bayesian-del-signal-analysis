@@ -1,125 +1,159 @@
-# Developer guide: DEL Bayesian Enrichment
+# Developer guide: DEL Bayesian enrichment
 
-This document explains how code under [`src/`](src/) fits together and how [`main.py`](main.py) wires a minimal end-to-end DEL-style analysis. It is aimed at engineers extending the prototype.
+This document explains how code under [`src/`](src/) fits together, how [`main.py`](main.py) orchestrates validation vs production runs, and which applied data-engineering choices keep **million-row** KinDEL-scale workloads tractable. It is aimed at engineers extending the pipeline beyond a synthetic prototype.
 
 ---
 
-## 1. Layout and execution model
+## 1. Repository layout
+
+The repo is organized as a **flat root** with a thin CLI entrypoint and a `src/` package for ingestion, inference, and visualization.
 
 ```
 bayesian-del-signal-analysis/
-  main.py              # CLI + demo orchestration
-  assets/              # curated plots for README/GitHub
-  out/                 # demo outputs (ignored by git)
+  main.py                 # CLI: validation (--demo) vs production (--input)
+  requirements.txt
+  data/                   # local datasets (gitignored except .gitkeep)
+  notebooks/              # production-scale exploration (Parquet, QC plots)
+  scripts/                # optional setup helpers
+  assets/                 # curated plots for README / docs
+  out/                    # run outputs (typically gitignored)
   src/
-    __init__.py        # Package facade (re-exports public API)
-    importer.py        # Real-world ingestion (KinDEL schema → standardized count columns)
-    simulator.py       # Synthetic count generation
-    analyzer.py        # Beta-Binomial priors, digamma mean, batched MC uncertainty, scaffolds
-    visualizer.py      # Matplotlib/Seaborn plots from enriched tables
+    __init__.py           # package facade (re-exports public API)
+    importer.py           # Ingestion & ETL: Parquet/CSV, schema mapping, depth normalization
+    simulator.py          # Synthetic count generation (validation / teaching only)
+    analyzer.py             # Statistical inference: Beta–Binomial posteriors, digamma means,
+                          # trigamma delta-method uncertainty, scaffold pooling, triage
+    visualizer.py         # Matplotlib / Seaborn plots from enriched tables
 ```
 
-**Import rule:** `main.py` uses imports such as `from src.analyzer import ...`. That works when the directory that **contains** the `src/` folder is on `sys.path`. In practice:
-
-- Run from the repo root: `python main.py --demo`.
-
-[`src/__init__.py`](src/__init__.py) does not auto-run anything; it only re-exports symbols so notebooks or other packages can do `import src` and get a stable surface.
+**Import rule:** use `from src.<module> import ...` with the **repo root** on `PYTHONPATH` (e.g. `python main.py` from the project root). [`src/__init__.py`](src/__init__.py) re-exports symbols for notebooks and downstream packages; it does not execute side effects.
 
 ---
 
-## 2. How the modules relate
+## 2. Module architecture
+
+End-to-end flow is **raw table → normalization / contract (ETL) → Bayesian enrichment → presentation**. Synthetic data bypasses real ingest but still lands on the same analyzer contract.
 
 ```mermaid
 flowchart LR
-  subgraph src_pkg [src package]
-    sim[simulator.py]
-    ana[analyzer.py]
-    vis[visualizer.py]
-  end
-  sim -->|"DataFrame counts"| ana
+  raw[(Raw KinDEL / DEL table\nCSV · TSV · Parquet)]
+  sim[simulator.py\nsynthetic counts]
+  imp[importer.py\nIngestion & ETL]
+  ana[analyzer.py\nInference layer]
+  vis[visualizer.py\nPlots]
+
+  raw --> imp
+  sim --> ana
+  imp -->|"input_count · selected_count"| ana
   ana -->|"enriched DataFrame"| vis
 ```
 
-| Module | Role | Primary inputs | Primary outputs |
-|--------|------|----------------|------------------|
-| [`simulator.py`](src/simulator.py) | Generate plausible **input** and **selected** read counts per compound (hits vs background, overdispersion, multinomial reallocation to library size). | `SimulationConfig` | `DataFrame` with `compound_id`, `is_hit`, `input_count`, `selected_count`, etc. |
-| [`importer.py`](src/importer.py) | Ingest real-world KinDEL tables: map schema columns → standardized `input_count`/`selected_count`, optional depth normalization across selected replicates, and common missing/low-count handling. | CSV/Parquet table + `KinDELImportConfig` | `DataFrame` suitable for `summarize_enrichment`. |
-| [`analyzer.py`](src/analyzer.py) | **Inference:** empirical Beta prior (MoM on a library proxy), conjugate Beta posteriors per compound, **digamma** closed form for `log2_enrichment_mean`, optional **batched** MC for CIs and `prob_enriched`, scaffold pooling + merge. | Count table + `BetaBinomialConfig` | Same rows plus enrichment columns; optional scaffold summary table. |
-| [`visualizer.py`](src/visualizer.py) | **Presentation:** scatter, ranked enrichment, volcano-style plot. No statistics; assumes columns already exist. | `DataFrame` + column names | `matplotlib.figure.Figure`; optional PNG path. |
+| Module | Layer | Role | Primary inputs | Primary outputs |
+|--------|--------|------|----------------|------------------|
+| [`importer.py`](src/importer.py) | **Ingestion & ETL** | **Parquet / delimited I/O**, KinDEL column aliasing (e.g. Parquet `seq_load` → `pre-selection_counts`), optional **depth scaling** across selected replicates (`LibraryScaler`), guards on replicate imbalance, standardized **`input_count` / `selected_count`**. | Path + `KinDELImportConfig` | `DataFrame` on the compound count contract |
+| [`analyzer.py`](src/analyzer.py) | **Statistical inference** | Empirical Beta prior (MoM), conjugate Beta posteriors per compound (and optionally per scaffold), **digamma** closed form for $\mathbb{E}[\log_2(p_\mathrm{sel}/p_\mathrm{in})]$, **trigamma delta-method** (default) or batched MC for uncertainty and $P(\text{enriched})$, scaffold aggregation, **`final_triage_hits`**. | Count table + `BetaBinomialConfig` | Enriched `DataFrame` (+ optional scaffold table) |
+| [`simulator.py`](src/simulator.py) | Validation | Plausible synthetic libraries for **`--demo`**; same columns the analyzer expects. | `SimulationConfig` | Count `DataFrame` |
+| [`visualizer.py`](src/visualizer.py) | Presentation | Scatter, ranked enrichment, volcano-style view; **no** statistics—assumes columns already exist. | `DataFrame` + column names | `matplotlib.figure.Figure` / PNG |
 
-There is no shared runtime state: each function receives data explicitly, which keeps testing and notebook use straightforward.
-
-**Primary point estimator (base-2):** for \(p \sim \mathrm{Beta}(a,b)\),
-\[
-\mathbb{E}[\log_2(p)] = \frac{\psi(a) - \psi(a+b)}{\ln(2)},
-\]
-so \(\mathbb{E}[\log_2(p_\mathrm{sel}/p_\mathrm{in})]\) is computed as a difference of those expectations (digamma). Monte Carlo is reserved for credible intervals and \(P(\log_2(\cdot) > 0)\).
+There is no shared mutable runtime: each stage receives data explicitly, which keeps tests and notebooks predictable.
 
 ---
 
-## 3. `main.py`: orchestration of the demo pipeline
+## 3. Production-grade math
 
-[`main.py`](main.py) is the **composition root** for the shipped demo. `run_demo(outdir)` performs a fixed sequence:
+**Model (high level):** independent Beta posteriors for input and selected multinomial rates; conjugate updates from binomial totals. The **default point estimate** for base-2 log enrichment uses the **digamma identity** for $\mathbb{E}[\log p]$ when $p \sim \mathrm{Beta}(a,b)$.
 
-1. **`simulate_del_experiment(SimulationConfig())`**  
-   Produces a compound-level count table (simulated DEL).
+**Digamma-based point estimate (per channel, base 2):**
 
-2. **Synthetic `scaffold_id`**  
-   For illustration only (`compound_id // 500`). Real pipelines should supply a chemical scaffold key from structure or encoding metadata.
+$$
+\mathbb{E}[\log_2(p)] = \frac{\psi(a) - \psi(a+b)}{\ln(2)}
+$$
 
-3. **`summarize_enrichment(df, BetaBinomialConfig())`**  
-   Adds `log2_enrichment_mean` (digamma), and unless `uncertainty_mode="none"`, also `log2_enrichment_ci_*` and `prob_enriched` (batched MC).
+For enrichment $\log_2(p_\mathrm{sel}/p_\mathrm{in})$ with **independent** posteriors on the two channels, the implementation uses the difference of the two expectations (each divided by $\ln 2$), matching $\mathbb{E}[\log p_\mathrm{sel}] - \mathbb{E}[\log p_\mathrm{in}]$ in natural log, then expressed in $\log_2$.
 
-4. **`aggregate_enrichment_by_scaffold(df2, ...)`**  
-   Sums counts per scaffold, applies the **same** inference recipe at scaffold granularity, emits `scaffold_log2_enrichment`.
+**Trigamma-based delta method (uncertainty, default production path):** for $\log p$ under the same Beta posterior, a standard delta-method variance uses **polygamma of order 1** (trigamma $\psi_1$). Converting to $\log_2$ scales variance by $1/(\ln 2)^2$:
 
-5. **`merge_scaffold_enrichment(df2, sc)`**  
-   Joins scaffold-level signal back onto each compound row for plotting or export.
+$$
+\mathrm{Var}[\log_2(p)] \approx \frac{\psi_1(a) - \psi_1(a+b)}{(\ln 2)^2}
+$$
 
-6. **`top_hits(df2, k=50)`**  
-   Ranks by `log2_enrichment_mean` and writes a small CSV.
+Under independence of input vs selected posteriors, the variance of $\log(p_\mathrm{sel}/p_\mathrm{in})$ is the **sum** of the two natural-log variances; the code applies the same scaling to obtain a Normal approximation for credible intervals and a **Normal CDF** proxy for $P(\log_2\text{enrichment} > 0)$. This is **not** a full hierarchical MCMC treatment—it is a deliberate **applied** trade-off: **vectorized $O(n)$ memory** vs storing an $(\text{MC samples} \times n)$ object.
 
-7. **Plotting**  
-   `plot_enrichment_scatter`, `plot_ranked_enrichment`, `plot_volcano` write PNGs under `outdir`.
-
-`main()` only parses CLI flags and delegates to `run_demo` (simulation) or a real-world ingest path (currently KinDEL via `src/importer.py`). There is no plugin system: to add stages (e.g. real FASTQ ingestion), extend the orchestration functions or add new entrypoints alongside `main.py`.
+**`BetaBinomialConfig.uncertainty_mode`:** `"delta"` is the **production default** (fast, memory-safe). `"mc_batched"` remains available for comparison; `"none"` drops uncertainty columns when only point estimates matter. Large MC paths can **auto-fallback** to delta when estimated batch allocations would exceed a safety budget (see `mc_auto_fallback_max_bytes` in [`analyzer.py`](src/analyzer.py)).
 
 ---
 
-## 4. Data contract (compound table)
+## 4. High-volume data handling
 
-Downstream code assumes a tidy table with at least:
+At **1M+** compound rows, naive patterns (duplicate wide frames, scatter plots of every row, unbounded MC tensors) dominate cost. Observed production-style benchmark on the documented DDR1 path: **under ~60 seconds** wall time for enrichment with **default delta-method uncertainty**, with **peak resident memory ~1.45 GB** (see [`RESEARCH_NOTES.md`](RESEARCH_NOTES.md) and [`notebooks/real_world_exploration.ipynb`](notebooks/real_world_exploration.ipynb)).
 
-- `input_count`, `selected_count`: non-negative integers summing to library totals used by the analyzer.
-- Optional: `scaffold_id` for family-level aggregation.
+**Strategies used or recommended in this repo:**
 
-The analyzer derives `total_input` and `total_selected` as **column sums** each time it runs; keep that invariant if you replace the simulator with real data loaders.
+- **Columnar I/O via Parquet** — [`importer.read_table`](src/importer.py) reads `.parquet` / `.pq` with `pandas.read_parquet`, which is appropriate for wide KinDEL dumps and reduces parse overhead vs raw CSV at scale.
+- **Explicit `gc.collect()` after large transformations** — notebook workflows drop heavy intermediates at phase boundaries so peak RSS does not retain dead large objects longer than necessary.
+- **Hexbin density for QC visualization** — for million-point views, **hexbin** on 1D NumPy arrays avoids materializing a second full-width working frame purely for density (contrast with naive duplicated `DataFrame` scatter pipelines). Production **`visualizer.py`** still uses scatter-oriented plots for moderate **n**; reserve hexbin for exploratory / QC paths at very large **n**.
 
----
-
-## 5. Configuration knobs worth knowing
-
-[`BetaBinomialConfig`](src/analyzer.py) centralizes behavior:
-
-- **`use_empirical_prior`**: library-wide MoM Beta prior vs fixed `alpha_prior` / `beta_prior`.
-- **`uncertainty_mode`**: `"mc_batched"` (default) vs `"none"` for large **n** when only point estimates are needed.
-- **`mc_batch_size`**: caps peak RAM for uncertainty (`O(mc_samples × mc_batch_size)`).
-
-[`SimulationConfig`](src/simulator.py) controls synthetic library size, hit count, and noise; it does not affect the analyzer’s math beyond the shape of the counts you pass in.
+Together with **delta-mode** inference (no per-row MC tensor), these choices keep the system in an **$O(n)$ working-set** regime suitable for real KinDEL enrichment rather than tutorial-scale toy data.
 
 ---
 
-## 6. Extension patterns
+## 5. Execution flow (`main.py`)
+
+**Validation mode — `python main.py --demo`**
+
+- Builds a synthetic library via **`simulate_del_experiment`**, assigns a toy **`scaffold_id`**, runs **`summarize_enrichment`** with default config, optional scaffold aggregation, **`merge_scaffold_enrichment`**, then hit listing and plots under `--outdir`.
+- Use this to verify installs, plotting, and analyzer wiring **without** real data.
+
+**Production mode — `python main.py --input <path> [--schema kindel] ...`**
+
+- Loads real data via **`load_kindel_dataset`** (Parquet/CSV/TSV), applies **`KinDELImportConfig`** (min counts, replicate scaling, scaffold column options, imbalance guardrails).
+- Runs the **same** **`summarize_enrichment`** path as the demo; scaffold aggregation runs when **`scaffold_id`** is present after import.
+- **Uncertainty** can be overridden with `--uncertainty-mode delta|mc_batched|none` (default follows **`BetaBinomialConfig`**, i.e. **delta**).
+
+**Bayesian shield triage**
+
+- After enrichment, **`final_triage_hits`** ranks compounds that pass **strong posterior evidence**: rows with **`prob_enriched` strictly greater than** the configured threshold (CLI **`--hit-prob-min`**, default **0.95**), then sorts by **`log2_enrichment_mean`** and keeps the top **K** (`--hits`).
+- If **no** rows pass the gate, the pipeline **falls back** to **`top_hits`** on score alone so the run still emits a non-empty **`top_hits.csv`** for inspection. Treat the triage gate as a **deliberate filter** against low-count noise (the “Bayesian shield”), not as a hard crash when the library is ambiguous.
+
+---
+
+## 6. Data contract (compound table)
+
+Downstream inference assumes a tidy table with at least:
+
+- **`input_count`**, **`selected_count`**: non-negative integers consistent with the library totals the analyzer uses.
+- Optional **`scaffold_id`** for family-level **`aggregate_enrichment_by_scaffold`**.
+
+The analyzer recomputes **`total_input`** and **`total_selected`** as column sums each run; preserve that invariant if you add new loaders.
+
+---
+
+## 7. Configuration knobs worth knowing
+
+[`BetaBinomialConfig`](src/analyzer.py):
+
+- **`use_empirical_prior`**: library-wide MoM Beta prior vs fixed **`alpha_prior` / `beta_prior`**.
+- **`uncertainty_mode`**: **`"delta"`** (default), **`"mc_batched"`**, or **`"none"`**.
+- **`mc_samples` / `mc_batch_size`**: MC cost and RAM when MC is enabled (`O(\text{mc_samples} \times \text{batch})$-style working set per batch).
+
+[`KinDELImportConfig`](src/importer.py): column names, **`selected_aggregation`** (`sum_raw` vs **`sum_scaled_depth`**), depth target, min counts, replicate imbalance cap, scaffold derivation.
+
+[`SimulationConfig`](src/simulator.py): synthetic library shape only; it does not change analyzer math beyond the counts you pass in.
+
+---
+
+## 8. Extension patterns
 
 | Goal | Suggested change |
 |------|------------------|
-| Real DEL counts | Use `src/importer.py` (KinDEL) or add a loader that emits the same `input_count`/`selected_count` contract; call `summarize_enrichment` unchanged. |
-| Different prior | Set `use_empirical_prior=False` and tune `alpha_prior` / `beta_prior`, or extend `estimate_empirical_beta_prior` with a documented alternative. |
-| Faster demos | Lower `mc_samples` or use `uncertainty_mode="none"` during development. |
-| New plots | Add functions in `visualizer.py` that read enrichment columns; keep plotting separate from `analyzer.py` to avoid circular imports and heavy deps in tests. |
+| Real DEL counts | Use **`importer.py`** or add a loader that emits **`input_count` / `selected_count`**; call **`summarize_enrichment`** unchanged. |
+| Different prior | Set **`use_empirical_prior=False`** and tune priors, or extend **`estimate_empirical_beta_prior`** with a documented alternative. |
+| Faster runs at huge **n** | Keep **`uncertainty_mode="delta"`**; avoid MC unless you need sampling-based intervals for comparison. |
+| New plots | Add functions in **`visualizer.py`**; keep plotting out of **`analyzer.py`** to limit import cycles and test weight. |
 
 ---
 
-## 7. Related reading
+## 9. Related reading
 
-- [`RESEARCH_NOTES.md`](RESEARCH_NOTES.md) — rationale for digamma means, MoM priors, and batched MC (methods / lessons learned angle).
+- [`RESEARCH_NOTES.md`](RESEARCH_NOTES.md) — digamma / trigamma derivations, empirical prior rationale, batched MC vs delta method, performance notes.
+- [`README.md`](README.md) — user-facing overview (may lag layout details; prefer this guide + source for contracts).

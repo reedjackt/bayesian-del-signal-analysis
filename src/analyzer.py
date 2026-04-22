@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 from scipy import special
 from scipy.stats import beta as beta_dist
+from scipy.stats import norm
 
 
 @dataclass(frozen=True)
@@ -20,9 +21,10 @@ class BetaBinomialConfig:
     mad_scale_floor: float = 1e-6
     mc_samples: int = 50_000
     mc_batch_size: int = 2048
-    uncertainty_mode: Literal["mc_batched", "none"] = "mc_batched"
+    uncertainty_mode: Literal["delta", "mc_batched", "none"] = "delta"
     seed: Optional[int] = 7
     credible_interval: Tuple[float, float] = (0.025, 0.975)
+    mc_auto_fallback_max_bytes: int = 512 * 1024 * 1024  # ~512MB per batch safety
 
 
 def beta_mom_from_mean_var(mean: float, var: float) -> tuple[float, float]:
@@ -36,10 +38,12 @@ def beta_mom_from_mean_var(mean: float, var: float) -> tuple[float, float]:
     v = float(var)
     denom = m * (1.0 - m)
     if v <= 0.0 or v >= denom:
-        return 1.0, 1.0
+        # Degenerate / inconsistent variance; prefer a mildly-informative symmetric prior
+        # to preserve shrinkage toward neutral enrichment in sparse regimes.
+        return 2.0, 2.0
     phi = denom / v - 1.0
     if phi <= 0.0:
-        return 1.0, 1.0
+        return 2.0, 2.0
     alpha = m * phi
     beta = (1.0 - m) * phi
     return max(alpha, 1e-6), max(beta, 1e-6)
@@ -143,6 +147,51 @@ def log2_enrichment_mean_digamma(
     e_log_sel = special.digamma(a_sel) - special.digamma(a_sel + b_sel)
     e_log_in = special.digamma(a_in) - special.digamma(a_in + b_in)
     return (e_log_sel - e_log_in) / np.log(2.0)
+
+
+def log2_enrichment_uncertainty_delta(
+    a_in: np.ndarray,
+    b_in: np.ndarray,
+    a_sel: np.ndarray,
+    b_sel: np.ndarray,
+    *,
+    credible_interval: tuple[float, float],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Fast, memory-safe uncertainty via delta-method Normal approximation.
+
+    For Beta(a,b): E[log p] = psi(a) - psi(a+b), Var[log p] = trigamma(a) - trigamma(a+b).
+    Assuming independence between selected and input posteriors:
+      Var[log(p_sel/p_in)] = Var[log p_sel] + Var[log p_in]
+    Convert to log2 by dividing by ln 2.
+
+    Implementation is fully vectorized: ``a_*``, ``b_*`` are ndarray inputs and
+    ``digamma`` / ``polygamma`` apply elementwise without Python loops or
+    per-row allocations (peak RAM scales like ``n``, not ``n * mc_samples``).
+    """
+    ln2 = np.log(2.0)
+    mean = log2_enrichment_mean_digamma(a_in, b_in, a_sel, b_sel)
+
+    var_log_sel = special.polygamma(1, a_sel) - special.polygamma(1, a_sel + b_sel)
+    var_log_in = special.polygamma(1, a_in) - special.polygamma(1, a_in + b_in)
+    var_log_ratio = np.maximum(var_log_sel + var_log_in, 0.0)
+    sd = np.sqrt(var_log_ratio) / ln2
+
+    lo_q, hi_q = credible_interval
+    z_lo = float(norm.ppf(lo_q))
+    z_hi = float(norm.ppf(hi_q))
+    lo = mean + z_lo * sd
+    hi = mean + z_hi * sd
+
+    # P(log2_enrichment > 0) under Normal(mean, sd)
+    # Handle sd==0 safely: if sd==0, probability is 1 if mean>0 else 0 if mean<0 else 0.5.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        z = (0.0 - mean) / sd
+        prob = 1.0 - norm.cdf(z)
+    prob = np.where(sd == 0.0, np.where(mean > 0.0, 1.0, np.where(mean < 0.0, 0.0, 0.5)), prob)
+    prob = np.clip(prob, 0.0, 1.0)
+
+    return lo, hi, prob
 
 
 def _batched_log2_enrichment_mc(
@@ -272,6 +321,7 @@ def summarize_enrichment(
 
     x_in = df[input_col].to_numpy(dtype=float)
     x_sel = df[selected_col].to_numpy(dtype=float)
+    n_rows = len(df)
 
     alpha0, beta0 = float(config.alpha_prior), float(config.beta_prior)
     if config.use_empirical_prior:
@@ -296,7 +346,44 @@ def summarize_enrichment(
         out["log2_enrichment_ci_low"] = np.nan
         out["log2_enrichment_ci_high"] = np.nan
         out["prob_enriched"] = np.nan
+    elif config.uncertainty_mode == "delta":
+        lo, hi, prob = log2_enrichment_uncertainty_delta(
+            a_in,
+            b_in,
+            a_sel,
+            b_sel,
+            credible_interval=config.credible_interval,
+        )
+        out["log2_enrichment_ci_low"] = lo
+        out["log2_enrichment_ci_high"] = hi
+        out["prob_enriched"] = prob
     else:
+        # MC can be accurate but is expensive; auto-fallback to delta when
+        # the per-batch allocation would be too large.
+        bsz = int(min(config.mc_batch_size, n_rows))
+        bytes_per_float = np.dtype(np.float64).itemsize
+        est_bytes = 3 * int(config.mc_samples) * bsz * bytes_per_float  # p_in, p_sel, log2_enr
+        if est_bytes > int(config.mc_auto_fallback_max_bytes):
+            lo, hi, prob = log2_enrichment_uncertainty_delta(
+                a_in,
+                b_in,
+                a_sel,
+                b_sel,
+                credible_interval=config.credible_interval,
+            )
+            out["log2_enrichment_ci_low"] = lo
+            out["log2_enrichment_ci_high"] = hi
+            out["prob_enriched"] = prob
+            out.attrs["uncertainty_fallback"] = {
+                "from": "mc_batched",
+                "to": "delta",
+                "reason": "estimated_mc_batch_memory_too_large",
+                "estimated_bytes": est_bytes,
+                "mc_samples": int(config.mc_samples),
+                "mc_batch_size": bsz,
+            }
+            return out
+
         lo, hi, prob = _batched_log2_enrichment_mc(
             a_in,
             b_in,
@@ -320,6 +407,28 @@ def top_hits(
     score_col: str = "log2_enrichment_mean",
 ) -> pd.DataFrame:
     return df.sort_values(score_col, ascending=False).head(int(k)).reset_index(drop=True)
+
+
+def final_triage_hits(
+    df: pd.DataFrame,
+    k: int = 50,
+    *,
+    score_col: str = "log2_enrichment_mean",
+    prob_col: str = "prob_enriched",
+    prob_min: float = 0.95,
+) -> pd.DataFrame:
+    """
+    Rank compounds by enrichment among rows with strong Bayesian evidence.
+
+    Keeps rows with ``prob_col > prob_min`` (strict inequality), then sorts by
+    ``score_col``. If ``prob_col`` is missing or no rows pass the gate, returns
+    an empty frame with the same columns as ``df``.
+    """
+    if prob_col not in df.columns:
+        return df.iloc[0:0].copy()
+    mask = df[prob_col].notna() & (df[prob_col] > float(prob_min))
+    gated = df.loc[mask]
+    return gated.sort_values(score_col, ascending=False).head(int(k)).reset_index(drop=True)
 
 
 def aggregate_enrichment_by_scaffold(
